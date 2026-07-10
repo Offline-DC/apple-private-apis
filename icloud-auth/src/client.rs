@@ -224,6 +224,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let client = ClientBuilder::new()
             .cookie_store(true)
             .add_root_certificate(Certificate::from_der(APPLE_ROOT)?)
+            // Bound the GrandSlam (login_email_pass) HTTP calls. Without this a
+            // connected-but-unresponsive Apple/anisette endpoint hangs the whole
+            // sign-in forever (connect_timeout alone can't catch a stalled read).
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
             // .proxy(Proxy::https("https://192.168.99.71:8080").unwrap())
             // .danger_accept_invalid_certs(true)
             .http1_title_case_headers()
@@ -302,8 +307,14 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                 LoginState::Needs2FAVerification => {
                     response = _self.verify_2fa(tfa_closure()).await?
                 }
-                LoginState::NeedsSMS2FA | LoginState::NeedsDevice2FA => {
-                    _self.send_2fa_to_devices().await?;
+                // Device 2FA: push the code to the trusted Apple devices and
+                // prompt for it. Do NOT also force an SMS — for accounts whose
+                // SMS slot #1 send fails that aborts the whole login with a bare
+                // AuthSrp *before* the device code can be entered.
+                LoginState::NeedsDevice2FA => {
+                    response = _self.send_2fa_to_devices().await?
+                }
+                LoginState::NeedsSMS2FA => {
                     response = _self.send_sms_2fa_to_devices(1).await?
                 }
                 LoginState::NeedsSMS2FAVerification(body) => {

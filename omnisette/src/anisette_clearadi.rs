@@ -282,8 +282,13 @@ impl ClearADIClient {
             ProvisionedFlavor::Mac
         };
 
-        // TODO hostuuid
-        let (session, cpim) = ProvisioningSession::new(&spim, &[], -2 /* GSA */, flavor.anisette())?;
+        // ADISetAndroidID needs the device's local-user identifier. ADI derives its
+        // MD-LU internally as SHA-256(identifier); we send X-Apple-I-MD-LU =
+        // hex(SHA-256(keychain_identifier)) in build_apple_request, so the identifier
+        // passed here MUST be keychain_identifier for the two to match. Passing empty
+        // (the old `// TODO hostuuid`) left ADI uninitialized → provisioning -45001.
+        let (session, cpim) =
+            ProvisioningSession::new(&spim, &state.keychain_identifier, -2 /* GSA */, flavor.anisette())?;
         
         let body_data = ProvisionBodyData { header: Dictionary::new(), request: Dictionary::from_iter([("cpim", base64_encode(&cpim))].into_iter()) };
         let resp = self.build_apple_request(state, http_client.post(end_provisioning_url))

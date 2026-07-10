@@ -6,12 +6,13 @@ use std::{collections::HashMap, fs, io::Cursor, path::PathBuf};
 use base64::engine::general_purpose;
 use chrono::{DateTime, SubsecRound, Utc};
 use log::debug;
+use log::error;
 use plist::{Data, Dictionary};
 use reqwest::{Certificate, Client, ClientBuilder, Proxy, RequestBuilder};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use rand::Rng;
 use sha2::{Sha256, Digest};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, tungstenite::client::IntoClientRequest};
 use uuid::Uuid;
 use futures_util::{stream::StreamExt, SinkExt};
 use std::fmt::Write;
@@ -100,6 +101,14 @@ impl Default for AnisetteState {
 impl AnisetteState {
     pub fn new() -> AnisetteState {
         AnisetteState::default()
+    }
+
+    /// Build an unprovisioned state whose machine identity is derived from a
+    /// specific 16-byte identifier (e.g. the dumb file's device_id UUID), so the
+    /// anisette headers (X-Mme-Device-Id / MD-LU) describe the SAME device as the
+    /// validation data — as they would on a real Mac.
+    pub fn with_keychain_identifier(keychain_identifier: [u8; 16]) -> AnisetteState {
+        AnisetteState { keychain_identifier, adi_pb: None }
     }
 
     pub fn is_provisioned(&self) -> bool {
@@ -228,16 +237,41 @@ impl AnisetteClient {
             }
         }
 
-        let headers = http_client.post(path)
+        let response = http_client.post(&path)
             .json(&body)
-            .send().await?
-            .json::<AnisetteHeaders>().await?;
+            .send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        log::info!("anisette get_headers: HTTP {status} from {path} ({} body byte(s))", text.len());
+        // Split send from parse so an empty / non-JSON / error response gives a real
+        // diagnostic instead of the opaque "EOF while parsing a value at line 1 column 0".
+        if !status.is_success() || text.trim().is_empty() {
+            let preview: String = text.chars().take(500).collect();
+            log::error!(
+                "anisette get_headers: unusable response — HTTP {status}, {} body byte(s): {preview:?}. \
+                 An EMPTY 2xx usually means the server couldn't build headers for this adi_pb/identifier \
+                 (re-provision needed); a 4xx/5xx or HTML body means the anisette server itself errored.",
+                text.len()
+            );
+            return Err(AnisetteError::Anyhow(anyhow::anyhow!(
+                "anisette /v3/get_headers returned HTTP {status} with {} body byte(s) (expected JSON headers)",
+                text.len()
+            )));
+        }
+        let headers: AnisetteHeaders = serde_json::from_str(&text).map_err(|e| {
+            let preview: String = text.chars().take(500).collect();
+            log::error!("anisette get_headers: response wasn't the expected JSON ({e}); body: {preview:?}");
+            AnisetteError::SerdeError(e)
+        })?;
+
         match headers {
             AnisetteHeaders::GetHeadersError { message } => {
                 if message.contains("-45061") {
+                    log::warn!("anisette get_headers: server reports not provisioned (-45061) — re-provision");
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    log::error!("anisette get_headers: server returned error result: {message}");
+                    Err(AnisetteError::Anyhow(anyhow::anyhow!("anisette server error: {message}")))
                 }
             },
             AnisetteHeaders::Headers { machine_id, one_time_password, routing_info } => {
@@ -254,7 +288,7 @@ impl AnisetteClient {
     }
 
     pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
-        debug!("Provisioning Anisette");
+        log::info!("anisette: provisioning (server {})", self.url);
         let http_client = make_reqwest()?;
         let resp = self.build_apple_request(&state, http_client.get("https://gsa.apple.com/grandslam/GsService2/lookup"))
             .send().await?;
@@ -267,8 +301,45 @@ impl AnisetteClient {
         let end_provisioning_url = urls.get("midFinishProvisioning").unwrap().as_string().unwrap();
         debug!("Got provisioning urls: {} and {}", start_provisioning_url, end_provisioning_url);
 
-        let provision_ws_url = format!("{}/v3/provisioning_session", self.url).replace("https://", "wss://");
-        let (mut connection, _) = connect_async(&provision_ws_url).await?;
+        // Map the HTTP(S) anisette base URL onto a WebSocket scheme — tungstenite
+        // only accepts ws:// / wss:// and rejects http(s):// with
+        // Url(UnsupportedUrlScheme). https→wss (TLS), and http→ws (insecure, for a
+        // plain-HTTP LAN test server). Only the scheme prefix is rewritten.
+        let ws_base = format!("{}/v3/provisioning_session", self.url);
+        let provision_ws_url = if let Some(rest) = ws_base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = ws_base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            ws_base
+        };
+        log::info!("anisette: connecting provisioning WebSocket {provision_ws_url}");
+        // Build the upgrade request explicitly so we can LOG exactly what we put on the
+        // wire (to compare against what nginx receives). This is identical to what
+        // connect_async(&url) does internally — tungstenite then APPENDS the standard
+        // handshake headers during the handshake itself: Connection: Upgrade,
+        // Upgrade: websocket, Sec-WebSocket-Version: 13, Sec-WebSocket-Key: <random>.
+        let ws_request = provision_ws_url.as_str().into_client_request()?;
+        log::info!("anisette: WS upgrade → {} {} {:?}",
+            ws_request.method(), ws_request.uri(), ws_request.version());
+        for (name, value) in ws_request.headers() {
+            log::info!("anisette: WS req header  {name}: {}", String::from_utf8_lossy(value.as_bytes()));
+        }
+        log::info!("anisette: WS req (tungstenite ALSO appends) Connection: Upgrade | Upgrade: websocket | Sec-WebSocket-Version: 13 | Sec-WebSocket-Key: <random-base64>");
+        let (mut connection, resp) = match tokio::time::timeout(
+            std::time::Duration::from_secs(15), connect_async(ws_request),
+        ).await {
+            Ok(r) => r?,
+            Err(_) => return Err(AnisetteError::Anyhow(anyhow::anyhow!(
+                "anisette provisioning WebSocket connect timed out ({provision_ws_url})"))),
+        };
+        // Success path: log the server's 101 upgrade RESPONSE headers too, so a working
+        // handshake can be compared against the failing one (which shows up in the error).
+        log::info!("anisette: WS upgrade response {:?}", resp.status());
+        for (name, value) in resp.headers() {
+            log::info!("anisette: WS resp header {name}: {}", String::from_utf8_lossy(value.as_bytes()));
+        }
+        log::info!("anisette: provisioning WebSocket connected");
 
 
         #[derive(Deserialize)]
@@ -287,8 +358,18 @@ impl AnisetteClient {
         }
 
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue
+            // Bound each message wait so a server that connects but goes silent errors
+            // out instead of hanging the sign-in. Also break cleanly on close/error
+            // (the old `else { continue }` spun forever on a closed socket).
+            let data = match tokio::time::timeout(
+                std::time::Duration::from_secs(30), connection.next(),
+            ).await {
+                Err(_) => return Err(AnisetteError::Anyhow(anyhow::anyhow!(
+                    "anisette provisioning stalled (no WebSocket message for 30s)"))),
+                Ok(None) => return Err(AnisetteError::Anyhow(anyhow::anyhow!(
+                    "anisette provisioning WebSocket closed before success"))),
+                Ok(Some(Err(e))) => return Err(AnisetteError::WsError(e)),
+                Ok(Some(Ok(d))) => d,
             };
             if data.is_text() {
                 let txt = data.to_text().unwrap();
@@ -314,7 +395,7 @@ impl AnisetteClient {
                         let spim = protocol_val.as_dictionary().unwrap().get("Response").unwrap().as_dictionary().unwrap()
                             .get("spim").unwrap().as_string().unwrap();
 
-                        debug!("GiveStartProvisioningData");
+                        log::info!("anisette: sent start-provisioning data");
                         #[derive(Serialize)]
                         struct Spim {
                             spim: String // base64
@@ -333,21 +414,23 @@ impl AnisetteClient {
                         let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
                         let response = protocol_val.as_dictionary().unwrap().get("Response").unwrap().as_dictionary().unwrap();
 
-                        debug!("GiveEndProvisioningData");
+                        log::info!("anisette: sent end-provisioning data");
 
                         #[derive(Serialize)]
                         struct EndProvisioning<'t> {
                             ptm: &'t str,
                             tk: &'t str,
+                            rinfo: &'t str
                         }
                         let end_provisioning = EndProvisioning {
                             ptm: response.get("ptm").unwrap().as_string().unwrap(),
                             tk: response.get("tk").unwrap().as_string().unwrap(),
+                            rinfo: response.get("X-Apple-I-MD-RINFO").unwrap().as_string().unwrap()
                         };
                         connection.send(Message::Text(serde_json::to_string(&end_provisioning)?)).await?;
                     },
                     ProvisionInput::ProvisioningSuccess { adi_pb } => {
-                        debug!("ProvisioningSuccess");
+                        log::info!("anisette: ✅ provisioning success");
                         state.adi_pb = Some(base64_decode(&adi_pb));
                         connection.close(None).await?;
                         break;
@@ -406,6 +489,7 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
             client.provision(state).await?;
             plist::to_file_xml(&config_path, state)?;
         }
+
         let data = match client.get_headers(&state).await {
             Ok(data) => data,
             Err(err) => {
@@ -414,7 +498,14 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
                     client.provision(state).await?;
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
-                } else { panic!() }
+                } else {
+                    // Any OTHER anisette error (e.g. a bad/incomplete server response
+                    // like the missing `X-Apple-I-MD-RINFO` field) must PROPAGATE so the
+                    // sign-in fails with a visible message. The old `panic!()` unwound
+                    // the native thread instead, leaving the UI stuck with no error.
+                    error!("get_anisette_headers: get_headers failed, aborting sign-in: {err}");
+                    return Err(err);
+                }
             },
         };
         Ok(data.get_headers())

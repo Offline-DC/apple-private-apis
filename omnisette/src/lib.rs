@@ -69,7 +69,9 @@ pub enum AnisetteError {
 
 pub const DEFAULT_ANISETTE_URL: &str = "https://ani.f1sh.me/";
 
-pub const DEFAULT_ANISETTE_URL_V3: &str = "https://ani.sidestore.io";
+// anisette v3 server (same host as the NAC validation server,
+// macos_remote::NAC_BASE_URL). Public host, https.
+pub const DEFAULT_ANISETTE_URL_V3: &str = "https://hw.openbubbles.app";
 
 pub trait AnisetteProvider {
     fn get_anisette_headers(&mut self) -> impl std::future::Future<Output = Result<HashMap<String, String>, AnisetteError>> + Send;

@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 async = ["dep:async-trait"]
-default = ["dep:remove-async-await", "async"]
+default = ["dep:remove-async-await", "async", "remote-anisette-v3"]
 remote-anisette-v3 = ["async", "dep:tokio-tungstenite", "dep:futures-util"]
 remote-clearadi = ["async", "dep:clearadi"]
 
@@ -30,7 +30,8 @@ chrono = { version = "0.4.37" }
 thiserror = "1.0.58"
 anyhow = "1.0.81"
 clearadi = { path = "../clearadi", optional = true }
-tokio = "1"
+# `time` for tokio::time::timeout (bounding the anisette provisioning WebSocket).
+tokio = { version = "1", features = ["time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dlopen2 = "0.4"

@@ -12,7 +12,6 @@ impl AnisetteData {
     /// Fetches the data at an anisette server
     pub async fn new<T: AnisetteProvider>(provider: &mut AnisetteClient<T>, client_info: LoginClientInfo) -> Result<Self, crate::Error> {
         let base_headers = provider.get_headers().await?.clone();
-
         Ok(AnisetteData { base_headers, client_info })
     }
 
