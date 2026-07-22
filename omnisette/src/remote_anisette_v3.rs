@@ -290,7 +290,7 @@ impl AnisetteClient {
     }
 
     pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
-        debug!("anisette: provisioning (server {})", self.url);
+        log::info!("anisette: provisioning (server {})", self.url);
         let http_client = make_reqwest()?;
         let resp = self.build_apple_request(&state, http_client.get("https://gsa.apple.com/grandslam/GsService2/lookup"))
             .send().await?;
