@@ -133,6 +133,9 @@ pub enum LoginState {
     Needs2FAVerification,
     NeedsSMS2FA,
     NeedsSMS2FAVerification(VerifyBody),
+    
+    NeedsFSAVerification(AuthenticationFSAChallenge),
+
     NeedsExtraStep(String),
     NeedsLogin,
 }
@@ -181,6 +184,28 @@ pub struct TrustedPhoneNumber {
     pub id: u32
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticationFSAChallenge {
+    pub challenge: String,
+    pub key_handles: Vec<String>,
+    pub rp_id: String,
+    pub allowed_credentials: String,
+}
+
+#[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticationFSAResponse {
+    pub challenge: String,
+    pub client_data: String,
+    pub signature_data: String,
+    pub authenticator_data: String,
+    #[serde(rename = "credentialID")]
+    pub credential_id: String,
+    pub user_handle: String, // ALWAYS EMPTY STRING
+    pub rp_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthenticationExtras {
@@ -194,6 +219,12 @@ pub struct AuthenticationExtras {
     pub repair_phone_number_web_url: Option<String>,
     #[serde(skip)]
     pub new_state: Option<LoginState>,
+    
+    // FSA 
+    pub account_name: Option<String>,
+    #[serde(default)]
+    pub key_names: Vec<String>,
+    pub fsa_challenge: Option<AuthenticationFSAChallenge>,
 }
 
 // impl Send2FAToDevices {
@@ -307,6 +338,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                 LoginState::Needs2FAVerification => {
                     response = _self.verify_2fa(tfa_closure()).await?
                 }
+                LoginState::NeedsFSAVerification(_) => {}
                 // Device 2FA: push the code to the trusted Apple devices and
                 // prompt for it. Do NOT also force an SMS — for accounts whose
                 // SMS slot #1 send fails that aborts the whole login with a bare
@@ -885,10 +917,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let resp = req.bytes().await?;
         info!("Got gsa auth extras {:?}", str::from_utf8(&resp).unwrap());
         let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
-        if new_state.trusted_phone_numbers.is_empty() {
-            return Err(Error::HardwareKeyError);
-        }
-        if status == 201 {
+        if let Some(fsa) = new_state.fsa_challenge.take() {
+            new_state.new_state = Some(LoginState::NeedsFSAVerification(fsa));
+        } else if status == 201 {
             new_state.new_state = Some(LoginState::NeedsSMS2FAVerification(VerifyBody {
                 phone_number: PhoneNumber {
                     id: new_state.trusted_phone_numbers.first().unwrap().id
@@ -1018,6 +1049,53 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             return Err(Error::Bad2faCode);
         }
 
+        self.tokens = res.headers().get_all("X-Apple-GS-Token").iter().chain(res.headers().get_all("X-Apple-HB-Token").iter()).map(|header| {
+            let decoded = String::from_utf8(base64::decode(&header.as_bytes()).expect("Not base64!")).expect("Decoded not utf8!");
+            let parts = decoded.split(":").collect::<Vec<&str>>();
+
+            // default one year; this won't bite me in the back at all...
+            let exp = parts.get(3).or(parts.get(2)).map(|i| i.parse().expect("Bad expiration format?")).unwrap_or(31536000);
+            let time = if exp > 40 * 365 * 24 * 60 * 60 * 1000 {
+                // ms since epoch
+                SystemTime::UNIX_EPOCH + Duration::from_millis(exp)
+            } else {
+                SystemTime::now() + Duration::from_secs(exp)
+            };
+            
+            (parts[0].to_string(), FetchedToken {
+                token: parts[1].to_string(),
+                expiration: time,
+            })
+        }).collect();
+
+        if let Some(pet) = res.headers().get("X-Apple-PE-Token") {
+            self.parse_pet_header(pet.to_str().unwrap());
+            return Ok(LoginState::LoggedIn);
+        }
+
+        Ok(LoginState::NeedsLogin)
+    }
+
+    pub async fn verify_security_key(&mut self, body: AuthenticationFSAResponse) -> Result<LoginState, Error> {
+        let headers = self.build_2fa_headers(true).await?;
+        // println!("Recieved code: {}", code);
+
+        // body.security_code = Some(VerifyCode { code });
+
+        let res = self
+            .client
+            .post("https://gsa.apple.com/auth/verify/security/key")
+            .headers(headers)
+            .header("accept", "application/json")
+            .json(&body)
+            .send().await?;
+
+        if res.status() != 200 {
+            error!("Security code failed, response: {}", res.text().await?);
+            return Err(Error::Bad2faCode);
+        }
+
+        // same as SMS 2FA
         self.tokens = res.headers().get_all("X-Apple-GS-Token").iter().chain(res.headers().get_all("X-Apple-HB-Token").iter()).map(|header| {
             let decoded = String::from_utf8(base64::decode(&header.as_bytes()).expect("Not base64!")).expect("Decoded not utf8!");
             let parts = decoded.split(":").collect::<Vec<&str>>();
