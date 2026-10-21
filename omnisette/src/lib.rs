@@ -82,9 +82,13 @@ pub trait AnisetteProvider {
     }
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "remote-anisette-v3"))]
+// `remote-anisette-v3` is in the crate's default feature set, so a build that
+// adds `remote-clearadi` without `default-features = false` has BOTH enabled.
+// Only one `DefaultAnisetteProvider` can exist, so when both are on, ClearADI
+// wins and this block steps aside. Builds with a single feature are unaffected.
+#[cfg(all(not(target_os = "macos"), feature = "remote-anisette-v3", not(feature = "remote-clearadi")))]
 pub type DefaultAnisetteProvider = RemoteAnisetteProviderV3;
-#[cfg(all(not(target_os = "macos"), feature = "remote-anisette-v3"))]
+#[cfg(all(not(target_os = "macos"), feature = "remote-anisette-v3", not(feature = "remote-clearadi")))]
 pub fn default_provider(info: LoginClientInfo, path: PathBuf) -> ArcAnisetteClient<DefaultAnisetteProvider> {
     Arc::new(Mutex::new(AnisetteClient::new(RemoteAnisetteProviderV3::new(
         DEFAULT_ANISETTE_URL_V3.to_string(),
